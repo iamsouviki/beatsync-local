@@ -1,0 +1,51 @@
+name: BeatSyncPhone
+options:
+  bundleIdPrefix: local.beatsync
+  deploymentTarget:
+    iOS: '16.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    CODE_SIGN_STYLE: Automatic
+targets:
+  BeatSyncPhone:
+    type: application
+    platform: iOS
+    sources: [App]
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: BeatSync Wi-Fi
+        NSLocalNetworkUsageDescription: Send app audio to your BeatSync room on the same Wi-Fi.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
+        UILaunchScreen: {}
+    entitlements:
+      path: App/BeatSync.entitlements
+      properties:
+        com.apple.security.application-groups: [group.local.beatsync.phone]
+    dependencies:
+      - target: Broadcast
+        embed: true
+  Broadcast:
+    type: app-extension
+    platform: iOS
+    sources: [Broadcast, Shared]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.beatsync.BeatSyncPhone.Broadcast
+    info:
+      path: Broadcast/Info.plist
+      properties:
+        NSLocalNetworkUsageDescription: Send app audio to your BeatSync room on Wi-Fi.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.broadcast-services-upload
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SampleHandler
+          RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
+    entitlements:
+      path: Broadcast/BeatSync.entitlements
+      properties:
+        com.apple.security.application-groups: [group.local.beatsync.phone]

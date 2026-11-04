@@ -1,0 +1,10 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { addresses } from '../server.mjs';
+import { fileURLToPath } from 'node:url';
+const dir = fileURLToPath(new URL('../.certs/', import.meta.url));
+mkdirSync(dir,{recursive:true,mode:0o700});
+const ips = ['127.0.0.1', ...addresses()];
+writeFileSync(dir+'openssl.cnf',`[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=BeatSync Local\n[ext]\nsubjectAltName=@alt\nbasicConstraints=critical,CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n[alt]\nDNS.1=localhost\n${ips.map((ip,i)=>`IP.${i+1}=${ip}`).join('\n')}\n`);
+execFileSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',dir+'key.pem','-out',dir+'cert.pem','-days','365','-config',dir+'openssl.cnf'],{stdio:'ignore'});
+console.log(`Created local certificate: ${dir}cert.pem\nRestart npm start. HTTPS is available on port 3443.\nTrust cert.pem on each sending computer (see README.md). No system trust settings were changed.\nIf your Wi-Fi IP changes, regenerate and trust the replacement certificate.`);

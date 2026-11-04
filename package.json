@@ -1,0 +1,29 @@
+{
+  "name": "beatsync-local",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Private Wi-Fi audio rooms with browser-to-browser casting",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.mjs",
+    "dev": "node --env-file-if-exists=.env --watch server.mjs",
+    "setup:https": "node scripts/https.mjs",
+    "test": "node --test",
+    "check": "node --check server.mjs && node --check native-bridge.mjs && node --check public/app.js",
+    "build:native": "node scripts/build-native.mjs",
+    "cast:android": "node scripts/android.mjs",
+    "setup:domain": "node scripts/setup-domain.mjs",
+    "connect:android": "node scripts/connect-android.mjs",
+    "build:android": "node scripts/build-android.mjs",
+    "service:install": "node scripts/service.mjs install",
+    "service:start": "node scripts/service.mjs start",
+    "service:stop": "node scripts/service.mjs stop",
+    "service:restart": "node scripts/service.mjs restart",
+    "service:status": "node scripts/service.mjs status",
+    "service:uninstall": "node scripts/service.mjs uninstall"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
