@@ -110,3 +110,17 @@ test('phone companion audio is authenticated, ordered, and distributed to room l
  await a.action(phone,{type:'stop'});
  assert.equal((await a.action(phone,{type:'phone-audio',seq:1,pcm})).status,403);
 });
+
+test('browser radio uses an authenticated audio stream and forwards PCM to its encoder',async t=>{
+ let output,encoded;const a=await setup(t,{radioFactory:()=>({stopped:false,add(res){output=res;res.write(Buffer.from('ID3test'));},write(pcm){encoded=pcm;},stop(){output?.end();}})});
+ const host=await a.create('Tab'),listener=await a.join(host.code,'Android browser');
+ const se=await a.stream(host),le=await a.stream(listener);await se('state');await le('state');
+ await a.action(host,{type:'pcm-start'});await le('state');
+ const controller=new AbortController();t.after(()=>controller.abort());
+ const response=await fetch(`${a.base}/api/rooms/${host.code}/audio?token=${listener.token}`,{signal:controller.signal});
+ assert.equal(response.status,200);assert.equal(response.headers.get('content-type'),'audio/mpeg');
+ const reader=response.body.getReader();assert.equal(Buffer.from((await reader.read()).value).toString(),'ID3test');
+ const pcm=Buffer.alloc(19200);assert.equal((await a.action(host,{type:'phone-audio',seq:0,pcm:pcm.toString('base64')})).status,200);assert.deepEqual(encoded,pcm);
+ const forbidden=await fetch(`${a.base}/api/rooms/${host.code}/audio?token=invalid`);assert.equal(forbidden.status,401);
+ controller.abort();
+});

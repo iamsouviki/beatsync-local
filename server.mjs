@@ -1,4 +1,5 @@
 import http from 'node:http';
+import {createRadio} from './mp3-radio.mjs';
 import {nativeAvailable, startNative} from './native-bridge.mjs';
 import https from 'node:https';
 import { readFileSync, existsSync } from 'node:fs';
@@ -10,9 +11,9 @@ const root = fileURLToPath(new URL('.', import.meta.url));
 export function addresses() {
   return Object.values(networkInterfaces()).flat().filter(x => x.family === 'IPv4' && !x.internal).map(x => x.address);
 }
-export function createApp({bridgeFactory = startNative} = {}) {
+export function createApp({bridgeFactory = startNative, radioFactory = createRadio} = {}) {
   let nativeOwner = null;
-  function stopBridge(room) { room.bridge?.stop(); room.bridge = null; if (nativeOwner === room.code) nativeOwner = null; room.sourceType = null; for (const m of room.members.values()) delete m.audioSeq; }
+  function stopBridge(room) { room.radio?.stop(); room.radio = null; room.bridge?.stop(); room.bridge = null; if (nativeOwner === room.code) nativeOwner = null; room.sourceType = null; for (const m of room.members.values()) delete m.audioSeq; }
   const rooms = new Map();
   const json = (res, status, data) => { res.writeHead(status, {'Content-Type': 'application/json', 'Cache-Control': 'no-store'}); res.end(JSON.stringify(data)); };
   const emit = (member, type, data) => member.connection?.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -21,7 +22,7 @@ export function createApp({bridgeFactory = startNative} = {}) {
   function remove(room, id) {
     const m = room.members.get(id);
     if (!m) return;
-    clearTimeout(m.timer); m.connection?.end(); room.members.delete(id);
+    clearTimeout(m.timer); m.audioConnection?.end(); m.connection?.end(); room.members.delete(id);
     if (room.sender === id) { stopBridge(room); room.sender = null; }
     broadcast(room);
     if (!room.members.size) rooms.delete(room.code);
@@ -47,7 +48,7 @@ export function createApp({bridgeFactory = startNative} = {}) {
         const timer = setTimeout(() => { if (!room.members.size) rooms.delete(code); }, 60000); timer.unref();
         return join(room,b,res);
       }
-      const match = url.pathname.match(/^\/api\/rooms\/([A-F0-9]{6})(?:\/(join|events|action))?$/);
+      const match = url.pathname.match(/^\/api\/rooms\/([A-F0-9]{6})(?:\/(join|events|action|audio))?$/);
       if (match) {
         const room = rooms.get(match[1]);
         if (!room) return json(res,404,{error:'Room not found. Check the code or create a new room.'});
@@ -55,28 +56,38 @@ export function createApp({bridgeFactory = startNative} = {}) {
         const token = req.headers.authorization?.replace(/^Bearer /,'') || url.searchParams.get('token');
         const member = [...room.members.values()].find(m => m.token === token);
         if (!member) return json(res,401,{error:'Please rejoin this room.'});
+        if (req.method === 'GET' && match[2] === 'audio') {
+          if (!room.sender || room.sourceType !== 'native' || room.sender === member.id) return json(res,409,{error:'No remote PCM audio broadcast is active.'});
+          if (!room.radio || room.radio.stopped) room.radio = radioFactory(message=>{for(const m of room.members.values())emit(m,'native-error',{message});});
+          clearTimeout(member.timer); member.audioConnection?.end(); member.audioConnection = res;
+          res.writeHead(200,{'Content-Type':'audio/mpeg','Cache-Control':'no-store','Connection':'keep-alive','X-Accel-Buffering':'no'});res.flushHeaders();
+          room.radio.add(res);
+          res.on('close',()=>{if(member.audioConnection!==res)return;member.audioConnection=null;if(!member.connection){member.timer=setTimeout(()=>remove(room,member.id),20000);member.timer.unref();}});
+          return;
+        }
         if (req.method === 'GET' && match[2] === 'events') {
           clearTimeout(member.timer);
           member.connection?.end(); member.connection = res;
           res.writeHead(200, {'Content-Type':'text/event-stream','Cache-Control':'no-cache, no-transform','Connection':'keep-alive','X-Accel-Buffering':'no'});
           res.write(': connected\n\n'); broadcast(room);
           const pulse = setInterval(() => res.write(': keepalive\n\n'),15000); pulse.unref();
-          req.on('close', () => { clearInterval(pulse); if (member.connection !== res) return; member.connection = null; broadcast(room); member.timer = setTimeout(() => remove(room,member.id),20000); member.timer.unref(); });
+          req.on('close', () => { clearInterval(pulse); if (member.connection !== res) return; member.connection = null; broadcast(room); if (!member.audioConnection) { member.timer = setTimeout(() => remove(room,member.id),20000); member.timer.unref(); } });
           return;
         }
         if (req.method === 'POST' && match[2] === 'action') {
           const b = await body(req);
           if (b.type === 'leave') remove(room,member.id);
           else if (b.type === 'listen') { member.listening = !!b.enabled; broadcast(room); }
-          else if (b.type === 'phone-start') {
+          else if (b.type === 'phone-start' || b.type === 'pcm-start') {
             if (room.sender) return json(res,409,{error:'Stop the current sender first.'});
-            room.sender = member.id; room.sourceType = 'native'; member.listening = false; member.audioSeq = -1; broadcast(room);
+            room.sender = member.id; room.sourceType = 'native'; member.listening = b.type === 'pcm-start'; member.audioSeq = -1; broadcast(room);
           } else if (b.type === 'phone-audio') {
             if (room.sender !== member.id || room.sourceType !== 'native' || member.audioSeq === undefined) return json(res,403,{error:'This device is not the phone sender.'});
             if (!Number.isSafeInteger(b.seq) || b.seq <= member.audioSeq || typeof b.pcm !== 'string' || b.pcm.length > 60000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(b.pcm)) return json(res,400,{error:'Invalid audio packet'});
             const bytes = Buffer.from(b.pcm,'base64');
             if (!bytes.length || bytes.length % 4) return json(res,400,{error:'Expected stereo 16-bit PCM'});
             member.audioSeq = b.seq;
+            room.radio?.write(bytes);
             for (const m of room.members.values()) if (m.id !== member.id && m.listening && m.connection && m.connection.writableLength < 512000) emit(m,'native-audio',{rate:48000,channels:2,pcm:b.pcm});
           } else if (b.type === 'native-start') {
             if (!['127.0.0.1','::1','::ffff:127.0.0.1'].includes(req.socket.remoteAddress)) return json(res,403,{error:'Start Mac app capture from http://localhost:3000 on the Mac. Remote devices cannot start system capture.'});
@@ -84,7 +95,7 @@ export function createApp({bridgeFactory = startNative} = {}) {
             nativeOwner = room.code; room.sender = member.id; room.sourceType = 'native';
             try {
               room.bridge = bridgeFactory({
-                onAudio(packet) { if (room.sender !== member.id) return; for (const m of room.members.values()) if (m.id !== member.id && m.listening && m.connection && m.connection.writableLength < 512000) emit(m,'native-audio',packet); },
+                onAudio(packet) { if (room.sender !== member.id) return; room.radio?.write(Buffer.from(packet.pcm,'base64')); for (const m of room.members.values()) if (m.id !== member.id && m.listening && m.connection && m.connection.writableLength < 512000) emit(m,'native-audio',packet); },
                 onError(message) { if (room.sender !== member.id) return; emit(member,'native-error',{message}); stopBridge(room); room.sender = null; broadcast(room); }
               });
             } catch(e) { stopBridge(room); room.sender = null; return json(res,400,{error:e.message}); }
@@ -107,7 +118,7 @@ export function createApp({bridgeFactory = startNative} = {}) {
       }
       if (req.method === 'GET' && url.pathname === '/download/android.apk' && existsSync(root + '.native/android/BeatSync-WiFi.apk')) { res.writeHead(200, {'Content-Type':'application/vnd.android.package-archive','Content-Disposition':'attachment; filename=BeatSync-WiFi.apk'}); return res.end(readFileSync(root + '.native/android/BeatSync-WiFi.apk')); }
       if (req.method === 'GET') {
-        const files = {'/':['index.html','text/html'], '/app.js':['app.js','text/javascript'], '/style.css':['style.css','text/css'], '/favicon.svg':['favicon.svg','image/svg+xml']};
+        const files = {'/':['index.html','text/html'], '/app.js':['app.js','text/javascript'], '/pcm-encoder.js':['pcm-encoder.js','text/javascript'], '/style.css':['style.css','text/css'], '/favicon.svg':['favicon.svg','image/svg+xml']};
         const f = files[url.pathname];
         if (f) { res.writeHead(200,{'Content-Type': f[1] + '; charset=utf-8','Cache-Control':'no-cache'}); return res.end(readFileSync(root + 'public/' + f[0])); }
       }
@@ -121,7 +132,7 @@ export function createApp({bridgeFactory = startNative} = {}) {
     member.timer = setTimeout(() => remove(room,member.id),30000); member.timer.unref();
     broadcast(room); json(res,200,{code:room.code, id:member.id, token:member.token});
   }
-  return {handler, close() { for (const room of rooms.values()) { stopBridge(room); for (const m of room.members.values()) { clearTimeout(m.timer); m.connection?.end(); } } rooms.clear(); }};
+  return {handler, close() { for (const room of rooms.values()) { stopBridge(room); for (const m of room.members.values()) { clearTimeout(m.timer); m.audioConnection?.end(); m.connection?.end(); } } rooms.clear(); }};
 }
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const app = createApp();

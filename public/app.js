@@ -4,6 +4,8 @@ let toneContext = null, toneTimer = null;
 let network = null, signalQueue = Promise.resolve(), toastTimer, leaving = false;
 const peers = new Map();
 let captureAttempt = null;
+let pcmForwarder = null;
+let nativeStreamKey = null;
 let nativeContext = null, nativeGain = null, nativeCursor = 0;
 const nativeNodes = new Set();
 const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -144,8 +146,9 @@ function reconcile() {
     const m = room.members.find(x => x.id === id);
     if (!m?.online || (mine ? !m.listening : !listening || room.sender !== id)) closePeer(id);
   }
-  if (room.sourceType !== 'native' || !room.sender) clearNativeAudio();
+  if (room.sourceType !== 'native' || !room.sender) { clearNativeAudio(); stopBrowserRadio(); }
   if (room.sourceType === 'native' && room.sender) {
+    if (!mine && listening) startBrowserRadio();
     if (mine) $('audio-status').textContent = 'Mac plays through its original app. Room volume controls apply on receiving devices.';
     return;
   }
@@ -213,7 +216,9 @@ $('cast').onclick = async () => {
     audioStream = new MediaStream(selected.getAudioTracks());
     selected.getTracks().forEach(t => t.onended = () => stopCasting());
     closePeers(); listening = true;
-    await action({type:'start'});
+    await beginPCMForwarding(audioStream);
+    $('audio').srcObject = audioStream;
+    playAudio();
     if (room?.sender === session.id) reconcile();
   } catch(e) {
     selected?.getTracks().forEach(t=>t.stop());
@@ -230,6 +235,7 @@ $('cast').onclick = async () => {
 };
 
 function cleanupCapture() {
+  pcmForwarder?.stop(); pcmForwarder = null;
   if (capture) { const s = capture; capture = null; s.getTracks().forEach(t=>{t.onended = null;t.stop();}); }
   audioStream = null;
   clearTimeout(toneTimer);
@@ -257,7 +263,7 @@ function unlockSpeaker() {
   audio.src = url; audio.play().catch(()=>{}).finally(()=>URL.revokeObjectURL(url));
 }
 async function playAudio() {
-  if (!listening || !$('audio').srcObject) return;
+  if (!listening || (!$('audio').srcObject && !nativeStreamKey)) return;
   try { await $('audio').play(); $('retry-audio').hidden = true; }
   catch { $('retry-audio').hidden = false; toast('Tap “Play incoming audio” to enable sound on this device.'); }
 }
@@ -271,7 +277,7 @@ $('listen').onclick = async () => {
     // Unlock the audio element during a user gesture where supported.
     if (next) unlockSpeaker();
     await action({type:'listen',enabled:next}); listening = next;
-    if (!listening) { setMediaPlayback('paused'); clearNativeAudio(); $('audio').pause(); if (room?.sender !== session.id) closePeers(); }
+    if (!listening) { setMediaPlayback('paused'); stopBrowserRadio(); clearNativeAudio(); $('audio').pause(); if (room?.sender !== session.id) closePeers(); }
     render(); reconcile();
   } catch(e) { listening = previous; render(); toast(e.message); }
 };
@@ -282,7 +288,7 @@ async function leave(notify = true) {
   setMediaPlayback('none');
   clearTimeout(toastTimer); $('toast').hidden = true;
   if (notify && session) try { await action({type:'leave'}); } catch {}
-  events?.close(); events = null; cleanupCapture(); clearNativeAudio(); nativeContext?.close(); nativeContext = null; nativeGain = null; session = null; room = null; listening = false;
+  events?.close(); events = null; cleanupCapture(); stopBrowserRadio(); clearNativeAudio(); nativeContext?.close(); nativeContext = null; nativeGain = null; session = null; room = null; listening = false;
   $('room').hidden = true; $('landing').hidden = false; history.replaceState(null,'',location.pathname);
 }
 $('leave').onclick = () => leave();
@@ -290,7 +296,7 @@ window.addEventListener('pagehide', () => {
   if (session) fetch(`/api/rooms/${session.code}/action`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+session.token},body:JSON.stringify({type:'leave'}),keepalive:true}).catch(()=>{});
   cleanupCapture(); events?.close();
 });
-$('audio').onplaying = () => { if ($('audio').srcObject) { $('audio-status').textContent = 'Playing live audio on this speaker'; setMediaPlayback('playing'); } };
+$('audio').onplaying = () => { if ($('audio').srcObject || nativeStreamKey) { $('audio-status').textContent = 'Playing live audio on this speaker'; setMediaPlayback('playing'); } };
 fetch('/api/info').then(r=>r.json()).then(info => { network = info; renderNetwork(); if(room) render(); }).catch(()=>{});
 
 $('test-tone').onclick = async () => {
@@ -315,6 +321,7 @@ function clearNativeAudio() {
   nativeNodes.clear(); nativeCursor = 0;
 }
 function receiveNativeAudio(packet) {
+  if (nativeStreamKey) return;
   if (!listening || room?.sourceType !== 'native' || room.sender === session?.id) return;
   if (!nativeContext || nativeContext.state !== 'running') {
     $('retry-audio').hidden = false;
@@ -370,3 +377,47 @@ document.addEventListener?.('visibilitychange', () => {
     configureBackgroundAudio(); nativeContext?.resume().catch(()=>{}); playAudio();
   }
 });
+
+async function beginPCMForwarding(stream) {
+  const Context = window.AudioContext || window.webkitAudioContext;
+  const context = new Context({sampleRate:48000});
+  let encoder, input, stopped=false, sending=false, seq=0;
+  const packets=[];
+  const stop=()=>{stopped=true;packets.length=0;if(encoder)encoder.port.onmessage=null;input?.disconnect();encoder?.disconnect();context.close().catch(()=>{});};
+  pcmForwarder={stop};
+  try {
+    await context.audioWorklet.addModule('/pcm-encoder.js');
+    if (context.sampleRate!==48000) throw new Error('This browser cannot create the 48 kHz audio stream.');
+    encoder=new AudioWorkletNode(context,'beatsync-pcm');
+    input=context.createMediaStreamSource(stream);
+    encoder.port.onmessage=e=>{
+      if(stopped)return;
+      if(packets.length>=3)packets.shift();
+      const bytes=new Uint8Array(e.data);
+      packets.push(btoa(String.fromCharCode(...bytes))); send();
+    };
+    async function send(){
+      if(sending||stopped)return;sending=true;
+      try{while(packets.length&&!stopped)await action({type:'phone-audio',seq:seq++,pcm:packets.shift()});}
+      catch(e){if(!stopped){toast('Audio upload stopped: '+e.message);stopCasting();}}
+      finally{sending=false;}
+    }
+    await action({type:'pcm-start'});
+    if(stopped)return;
+    input.connect(encoder);encoder.connect(context.destination);await context.resume();
+  } catch(e){stop();throw e;}
+}
+
+function startBrowserRadio() {
+  const key=session.code+':'+room.sender;
+  if(nativeStreamKey===key)return;
+  clearNativeAudio();nativeStreamKey=key;
+  const audio=$('audio');audio.srcObject=null;
+  audio.src=`/api/rooms/${session.code}/audio?token=${encodeURIComponent(session.token)}`;
+  audio.onerror=()=>{if(nativeStreamKey){nativeStreamKey=null;$('audio-status').textContent='Audio stream disconnected. Toggle this speaker to reconnect; check the server has FFmpeg installed.';}};
+  configureBackgroundAudio();playAudio();
+}
+function stopBrowserRadio() {
+ if(!nativeStreamKey)return;nativeStreamKey=null;
+ const audio=$('audio');audio.onerror=null;audio.pause();audio.removeAttribute?.('src');audio.load?.();
+}

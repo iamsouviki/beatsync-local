@@ -128,3 +128,8 @@ Original implementation informed by these projects; no third-party source is ven
 ## License
 
 [MIT](LICENSE).
+
+
+### Browser-only background audio transport
+
+Desktop tab capture now encodes PCM in an AudioWorklet and uploads bounded packets to the room. Install FFmpeg on the server (`brew install ffmpeg` on macOS); the server uses its MP3 encoder to provide an authenticated continuous `audio/mpeg` response to the receiving browser's audio element. Native Mac/phone audio uses the same receiving path. Receivers do not need an APK for this transport, and playback no longer relies on JavaScript scheduling each PCM buffer while the screen is locked. FFmpeg starts only when a listener requests a live stream and stops with the broadcast. This is a bandwidth/latency tradeoff compared with WebRTC and remains experimental. Physical Android/iPhone locked-screen playback must still be tested, and OS/browser media policies can interrupt audio. Start with a user tap and keep the room tab open.
