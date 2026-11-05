@@ -3,6 +3,7 @@ let session = null, room = null, events = null, capture = null, audioStream = nu
 let toneContext = null, toneTimer = null;
 let network = null, signalQueue = Promise.resolve(), toastTimer, leaving = false;
 const peers = new Map();
+let captureAttempt = null;
 let nativeContext = null, nativeGain = null, nativeCursor = 0;
 const nativeNodes = new Set();
 const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
@@ -69,7 +70,7 @@ function render() {
   $('stop').hidden = !mine;
   $('listen').disabled = false;
   $('listen').textContent = listening ? 'Disable this speaker ◖))' : 'Enable this speaker ◖))';
-  $('cast').disabled = !canCapture;
+  $('cast').disabled = !canCapture || !!captureAttempt;
   $('native-cast').disabled = !network?.nativeAvailable || !network?.nativeHost;
   $('native-hint').textContent = !network?.nativeHost ? 'Start Mac app audio from localhost on the Mac. This device can listen.' : !network?.nativeAvailable ? 'Run npm run build:native on the Mac first.' : 'Captures desktop music apps. Browser audio is excluded to prevent feedback.';
   if (sender && room.sourceType === 'native') { $('cast-title').textContent = `${sender.name} is sharing app audio.`; $('cast-description').textContent = mine ? 'Play music in a native Mac app. The Mac plays its original audio; joined devices receive the stream. macOS recording permission is required.' : 'Receiving app audio over Wi-Fi. Keep this page open.'; }
@@ -171,21 +172,63 @@ async function receiveSignal({from,signal}) {
     }
   }
 }
+function finishCaptureAttempt(attempt) {
+  clearTimeout(attempt.timer);
+  if (captureAttempt !== attempt) return;
+  captureAttempt = null;
+  $('cast').disabled = !canCapture;
+  $('cast').textContent = 'Cast a music tab ↗';
+  $('capture-progress').hidden = true;
+  $('cancel-capture').disabled = false;
+}
+function cancelCaptureRequest() {
+  if (!captureAttempt) return;
+  const attempt = captureAttempt;
+  attempt.cancelled = true;
+  finishCaptureAttempt(attempt);
+  toast('Request cancelled here. Close the browser sharing picker if it is still open.');
+}
+$('cancel-capture').onclick = cancelCaptureRequest;
 $('cast').onclick = async () => {
   if (!canCapture || !session) return showHelp();
+  if (captureAttempt) return;
+  const attempt = {cancelled:false,sessionId:session.id,timer:null};
+  captureAttempt = attempt;
+  $('cast').disabled = true;
+  $('cast').textContent = 'Choose a tab in your browser…';
+  $('capture-progress').hidden = false;
+  $('capture-progress-text').textContent = 'Waiting for the browser’s sharing picker. Select your music tab, enable Share tab audio, then click Share.';
+  attempt.timer = setTimeout(() => {
+    if (captureAttempt === attempt) $('capture-progress-text').textContent = 'Still waiting for the browser. Check for a sharing dialog behind this window. If none appears, cancel here and open BeatSync in desktop Chrome or Edge at the localhost address printed by the server. On macOS, check the browser’s Screen & System Audio Recording permission.';
+  },15000);
   let selected;
   try {
+    // Must run directly in the click gesture, before any network or permission await.
     selected = await navigator.mediaDevices.getDisplayMedia({video:{displaySurface:'browser'},audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false,suppressLocalAudioPlayback:true},selfBrowserSurface:'exclude',systemAudio:'include',surfaceSwitching:'exclude'});
+    if (attempt.cancelled || !session || session.id !== attempt.sessionId) { selected.getTracks().forEach(t=>t.stop()); return; }
     if (!selected.getAudioTracks().length) { selected.getTracks().forEach(t=>t.stop()); return toast('No audio was shared. Choose a Chrome tab and enable “Share tab audio”.'); }
+    $('capture-progress-text').textContent = 'Tab audio selected. Starting the room broadcast…';
+    $('cancel-capture').disabled = true;
     capture = selected;
     audioStream = new MediaStream(selected.getAudioTracks());
     selected.getTracks().forEach(t => t.onended = () => stopCasting());
     closePeers(); listening = true;
     await action({type:'start'});
-    // SSE may arrive before or after the POST response.
     if (room?.sender === session.id) reconcile();
-  } catch(e) { selected?.getTracks().forEach(t=>t.stop()); cleanupCapture(); toast(e.name === 'NotAllowedError' ? 'Sharing was cancelled or blocked. Choose a music tab and allow tab audio.' : e.message); }
+  } catch(e) {
+    selected?.getTracks().forEach(t=>t.stop());
+    if (attempt.cancelled || session?.id !== attempt.sessionId) return;
+    cleanupCapture();
+    const messages = {
+      NotAllowedError:'Sharing was cancelled or blocked. Allow browser sharing and select a tab with audio.',
+      NotReadableError:'The browser could not start capture. On macOS, allow this browser in Screen & System Audio Recording, then retry.',
+      InvalidStateError:'The browser cannot open capture from this window. Focus a desktop Chrome or Edge window and click Cast again.',
+      NotFoundError:'The browser found no shareable source. Open the music in another desktop browser tab first.'
+    };
+    toast(messages[e.name] || e.message || 'Could not start tab audio capture.');
+  } finally { finishCaptureAttempt(attempt); }
 };
+
 function cleanupCapture() {
   if (capture) { const s = capture; capture = null; s.getTracks().forEach(t=>{t.onended = null;t.stop();}); }
   audioStream = null;
@@ -234,6 +277,7 @@ $('listen').onclick = async () => {
 };
 $('volume').oninput = () => { $('audio').volume = Number($('volume').value)/100; $('volume-value').value = $('volume').value+'%'; if (nativeGain) nativeGain.gain.value = Number($('volume').value)/100; };
 async function leave(notify = true) {
+  if (captureAttempt) { captureAttempt.cancelled = true; finishCaptureAttempt(captureAttempt); }
   leaving = true;
   setMediaPlayback('none');
   clearTimeout(toastTimer); $('toast').hidden = true;

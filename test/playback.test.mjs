@@ -76,3 +76,24 @@ test('music audio session and lock-screen controls are installed on speaker acti
  await handlers.pause();assert.equal(b.run('listening'),false);
  await handlers.play();assert.equal(b.run('listening'),true);
 });
+
+test('pending browser picker can be cancelled and late-selected tracks are stopped',async()=>{
+ const b=browser();let choose;let stopped=0;
+ b.context.navigator.mediaDevices.getDisplayMedia=()=>new Promise(resolve=>{choose=resolve;});
+ b.run("session={id:'self',code:'ABC123',token:'token'};");
+ const pending=b.elements.get('cast').onclick();
+ assert.equal(b.elements.get('cast').disabled,true);
+ assert.equal(b.elements.get('capture-progress').hidden,false);
+ b.elements.get('cancel-capture').onclick();
+ assert.equal(b.elements.get('cast').disabled,false);
+ choose({getTracks:()=>[{stop(){stopped++;}}]});await pending;
+ assert.equal(stopped,1);assert.equal(b.run('audioStream'),null);
+});
+test('OS capture failures restore controls and explain the recording permission',async()=>{
+ const b=browser();b.context.navigator.mediaDevices.getDisplayMedia=async()=>{const e=new Error('OS capture failed');e.name='NotReadableError';throw e;};
+ b.run("session={id:'self',code:'ABC123',token:'token'};");
+ await b.elements.get('cast').onclick();
+ assert.equal(b.elements.get('cast').disabled,false);
+ assert.equal(b.elements.get('capture-progress').hidden,true);
+ assert.match(b.elements.get('toast').textContent,/Screen & System Audio Recording/);
+});
