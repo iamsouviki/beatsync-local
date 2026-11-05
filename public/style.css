@@ -5,3 +5,5 @@
 .cast-panel .broadcast-note{font-size:11px;background:#f1f4e9;border:1px solid #e0e8d1;border-radius:8px;padding:12px;margin:18px auto 0;max-width:none}.broadcast-note .textbutton{font-size:11px;color:#536d2d;text-decoration:underline}
 
 #native-cast{margin-top:16px}
+
+#capture-progress{background:#f1f4e9;border:1px solid #dce5d0;border-radius:8px;padding:14px;margin-top:12px;text-align:left}#capture-progress p{font-size:12px;line-height:1.7}#capture-progress button{width:100%}
